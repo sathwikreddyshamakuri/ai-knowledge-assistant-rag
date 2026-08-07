@@ -1,35 +1,32 @@
-# AI Knowledge Assistant – Retrieval-Augmented Generation (RAG)
+# AI Knowledge Assistant — Retrieval-Augmented Generation (RAG)
 
-A Retrieval-Augmented Generation (RAG) application built with **FastAPI**, **OpenAI API**, and **ChromaDB** that answers user questions by retrieving semantically relevant document chunks before generating responses.
+A Retrieval-Augmented Generation (RAG) backend built with **FastAPI**, the **OpenAI Responses API**, and **ChromaDB** for answering natural language questions over user-uploaded documents.
 
-Unlike a standard LLM chatbot, this project grounds its answers using uploaded documents, reducing hallucinations and improving factual accuracy.
-
----
-
-# Project Overview
-
-This project demonstrates the complete workflow of a modern Retrieval-Augmented Generation (RAG) system.
-
-Users can upload one or more text documents, ask natural language questions, and receive AI-generated answers grounded in the most relevant document content.
-
-The project is built incrementally to understand each component of a Retrieval-Augmented Generation (RAG) pipeline from first principles instead of relying on high-level frameworks.
+Instead of relying solely on an LLM's internal knowledge, the system retrieves semantically relevant document chunks from a vector database and injects them into the prompt, allowing responses to remain grounded in uploaded content.
 
 ---
 
-# Architecture
+## Project Overview
+
+This project implements the core components of a RAG pipeline from scratch: document chunking, embedding generation, vector indexing, semantic retrieval, prompt construction, and streaming responses.
+
+A deliberate design decision was made **not** to use orchestration frameworks such as LangChain or LlamaIndex. Building each component directly against the OpenAI API and ChromaDB made it possible to understand retrieval behavior, vector indexing, prompt construction, and streaming mechanics without framework abstractions.
+
+---
+
+## System Architecture
 
 ```
-
                 Upload Documents
                         │
                         ▼
               Text Extraction (.txt)
                         │
                         ▼
-                  Chunking
+             Overlapping Chunking
                         │
                         ▼
-             OpenAI Embedding Model
+         OpenAI Embedding Generation
                         │
                         ▼
               Chroma Vector Database
@@ -38,222 +35,202 @@ The project is built incrementally to understand each component of a Retrieval-A
            Semantic Similarity Search
                         │
                         ▼
-          Top-K Semantically Relevant Chunks Retrieved
+         Top-K Relevant Chunks Retrieved
                         │
                         ▼
-      OpenAI LLM Generates Final Answer
+      OpenAI Responses API (Grounded Prompt)
                         │
                         ▼
           Streaming Response via FastAPI
-
 ```
----
-Each uploaded document is split into overlapping chunks, converted into embeddings using OpenAI Embeddings, indexed in ChromaDB with metadata, and retrieved through semantic similarity search before being provided as context to the language model.
+
 ---
 
-# Features
+## Features
 
-- AI-powered question answering using OpenAI Responses API
-- Real-time streaming responses
-- Upload and index one or more text documents
-- Automatic document chunking
-- Embedding generation using OpenAI Embeddings
-- Semantic similarity search using ChromaDB
+- Semantic document search using vector embeddings
+- Multi-document indexing
 - Retrieval-Augmented Generation (RAG)
-- Multi-document semantic retrieval
-- FastAPI REST API backend
+- Streaming AI responses
+- Automatic document chunking
+- OpenAI embedding generation
+- ChromaDB vector storage
 - Metadata-aware document indexing
+- FastAPI REST API backend
 
 ---
 
-# Tech Stack
+## Engineering Decisions
+
+### Building without RAG frameworks
+
+Rather than using LangChain or LlamaIndex, the retrieval pipeline was implemented directly against the OpenAI API and ChromaDB.
+
+This exposed every stage of the retrieval process:
+
+- document chunking
+- embedding generation
+- vector indexing
+- similarity search
+- prompt construction
+- streaming responses
+
+The goal was to understand how modern RAG systems work internally before introducing orchestration frameworks.
+
+### Chunk size (500 characters)
+
+Documents are divided into approximately 500-character chunks. This size was selected because:
+
+- chunks remain small enough to retrieve precise information
+- embeddings remain focused on a single topic
+- context windows are used efficiently
+- retrieval avoids returning unnecessarily large passages
+
+Very large chunks reduce retrieval precision, because multiple unrelated concepts become embedded together.
+
+### Overlap (100 characters)
+
+A 100-character overlap is maintained between consecutive chunks.
+
+Without overlap, important sentences located near chunk boundaries may be split across two chunks, causing incomplete retrieval. Overlapping preserves context while introducing only a small amount of redundancy.
+
+### Top-K retrieval
+
+The system retrieves the top 3 most semantically similar chunks. Three chunks generally provide enough context for accurate responses while keeping prompts compact.
+
+Retrieving too few risks missing relevant information; retrieving too many increases token usage and may introduce unrelated context.
+
+### Embedding model selection
+
+The project currently uses `text-embedding-3-small` for:
+
+- lower latency
+- lower API cost
+- strong semantic retrieval quality for small and medium-sized document collections
+
+Although `text-embedding-3-large` provides higher-quality embeddings, the additional cost was not justified at the current scale. The implementation is model-agnostic and can be upgraded without architectural changes.
+
+---
+
+## Technology Stack
 
 | Category | Technology |
-|----------|------------|
+|---|---|
 | Language | Python |
 | Backend | FastAPI |
-| LLM | OpenAI GPT Models (Responses API) |
-| Embeddings | text-embedding-3-small |
+| LLM | OpenAI Responses API |
+| Embeddings | `text-embedding-3-small` |
 | Vector Database | ChromaDB |
 | API Testing | Swagger UI |
-| Streaming | FastAPI StreamingResponse |
+| Streaming | FastAPI `StreamingResponse` |
 
 ---
 
-# API Endpoints
+## API Endpoints
 
-## Upload Documents
+### `POST /upload-document`
 
-```
-POST /upload-document
-```
+Uploads one or more text documents. Each uploaded document is extracted, chunked, embedded, and indexed in ChromaDB.
 
-Uploads one or more text documents.
+### `POST /ask-ai`
 
-Each document is:
+General-purpose AI endpoint without retrieval.
 
-- extracted
-- chunked
-- embedded
-- stored inside ChromaDB
+### `POST /ask-ai-document`
 
----
-
-## Ask AI
-
-```
-POST /ask-ai
-```
-
-General AI assistant without document retrieval.
-
----
-
-## Ask AI using RAG
-
-```
-POST /ask-ai-document
-```
+Question-answering endpoint backed by semantic retrieval.
 
 Workflow:
 
-- Convert question into embedding
-- Search ChromaDB
-- Retrieve Top-K relevant chunks
-- Build grounded prompt
-- Generate streamed response
+1. Embed the user's question
+2. Perform semantic similarity search in ChromaDB
+3. Retrieve the top-K matching chunks
+4. Build a grounded prompt
+5. Generate a streamed response
 
 ---
 
-# Project Workflow
+## Current Capabilities
 
-### 1. Upload Documents
-
-Users upload one or more text files.
-
-↓
-
-### 2. Document Processing
-
-Documents are converted into plain text.
-
-↓
-
-### 3. Chunking
-
-Large documents are divided into overlapping chunks.
-
-↓
-
-### 4. Embedding Generation
-
-Each chunk is converted into a high-dimensional vector using OpenAI Embeddings.
-
-↓
-
-### 5. Vector Storage
-
-Chunk embeddings and metadata are stored inside ChromaDB.
-
-↓
-
-### 6. Semantic Search
-
-When a question is asked:
-
-- the question is embedded
-- ChromaDB finds the most semantically similar chunks
-
-↓
-
-### 7. Retrieval-Augmented Generation
-
-Retrieved chunks are injected into the LLM prompt.
-
-↓
-
-### 8. Streaming Response
-
-The generated answer is streamed back to the client.
-
----
-
-# Current Capabilities
-
-- Streaming AI responses
-- Prompt engineering
-- Document processing
-- Chunking with overlap
-- Embedding generation
-- Vector search
+- Multi-document indexing
+- Semantic vector search
+- Retrieval-Augmented Generation
+- Streaming responses
+- Metadata-aware indexing
+- OpenAI embedding generation
 - ChromaDB integration
-- Multi-document retrieval
-- Retrieval-Augmented Generation (RAG)
-- Vector Database Design
+- FastAPI backend
 
 ---
 
-# Planned Enhancements
+## Challenges Encountered
 
-- Session-based document isolation
-- Metadata filtering for document-specific retrieval
+Several implementation issues were identified and resolved during development:
+
+- **Manual similarity search.** Initial retrieval used hand-written cosine similarity before migrating to ChromaDB's built-in vector search.
+- **Chunk ID collisions.** Chunk IDs originally collided when multiple documents were uploaded, silently overwriting data. Unique document-scoped chunk identifiers were introduced to prevent this.
+- **Single-document retrieval.** Retrieval was initially limited to individual documents. The architecture was redesigned to support semantic retrieval across the entire indexed collection.
+- **Missing grounding.** Prompt construction was updated so retrieved context is always supplied to the model before answer generation.
+
+---
+
+## Current Limitations
+
+The current implementation intentionally keeps the architecture simple.
+
+- Supports `.txt` documents only
+- No user authentication or session isolation
+- No rate limiting or request throttling
+- No retrieval evaluation metrics (Recall@K, Precision@K, MRR, hit rate)
+- No citation highlighting of retrieved source passages
+- Previously uploaded documents remain indexed until the vector database is cleared
+- No frontend; interaction is through FastAPI Swagger UI
+
+---
+
+## Planned Enhancements
+
 - PDF document support
-- React frontend
+- Session-based document isolation
+- Metadata filtering
 - Conversational memory
 - Source citations
 - Docker containerization
-- AWS cloud deployment
+- React frontend
+- AWS deployment
 
 ---
 
-# Running the Project
+## Running the Project
 
-## Clone
+Clone the repository:
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/sathwikreddyshamakuri/ai-knowledge-assistant-rag
 ```
 
-## Install dependencies
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Set your OpenAI API key
+Configure your API key in a `.env` file:
 
 ```bash
 OPENAI_API_KEY=your_api_key
 ```
 
-## Run
+Run the server:
 
 ```bash
 uvicorn main:app --reload
 ```
 
-Open Swagger UI:
-
-```
-http://127.0.0.1:8000/docs
-```
+Open Swagger UI at `http://127.0.0.1:8000/docs`.
 
 ---
 
-# Learning Objectives
+## License
 
-This project was built to gain hands-on experience with the core concepts behind modern LLM applications, including:
-
-- Prompt Engineering
-- Streaming Responses
-- Document Processing
-- Chunking Strategies
-- Embeddings
-- Vector Databases
-- Semantic Search
-- Retrieval-Augmented Generation (RAG)
-- FastAPI Backend Development
-
----
-
-# License
+MIT
