@@ -23,13 +23,6 @@ class Question(BaseModel):
     question: str = Field(min_length=1)
 
 
-# class AIResponse(BaseModel):
-#     title: str
-#     explanation: str
-#     example: str
-#     key_points: list[str]
-
-
 def generator_response(user_question):
 
     instructions = """
@@ -69,11 +62,17 @@ def ask_ai(request: Question):
 
     user_question = request.question.strip()
 
+    if not validate_prompt_injection(user_question):
+
+        raise HTTPException(
+            status_code=400,
+            detail="The request was rejected because it contains a potentially unsafe instruction."
+        )
+
     return StreamingResponse(
         generator_response(user_question),
         media_type="text/plain"
     )
-
 
 def extract_text_from_txt(file):
 
@@ -106,7 +105,8 @@ def split_into_chunks(text, chunk_size=500, overlap=100):
 def store_chunks_in_chroma(
     chunks,
     document_id,
-    document_name
+    document_name,
+    session_id
 ):
 
     for index, chunk in enumerate(chunks):
@@ -131,16 +131,21 @@ def store_chunks_in_chroma(
                 {
                     "document_id": document_id,
                     "document_name": document_name,
-                    "chunk_number": index
+                    "chunk_number": index,
+                    "session_id": session_id
                 }
             ]
         )
 
 
-def generator_document_response(user_question):
+def generator_document_response(
+    user_question,
+    session_id
+):
 
     relevant_chunks = search_chroma(
         user_question,
+        session_id,
         top_k=3
     )
 
@@ -191,8 +196,12 @@ def generator_document_response(user_question):
 
 @app.post("/upload-document")
 def upload_document(
-    files: List[UploadFile] = File(...)
+    files: List[UploadFile] = File(...),
+    session_id: str = ""
 ):
+
+    if not session_id:
+        session_id = str(uuid.uuid4())
 
     uploaded_documents = []
 
@@ -211,7 +220,8 @@ def upload_document(
         store_chunks_in_chroma(
             chunks,
             document_id,
-            file.filename
+            file.filename,
+            session_id
         )
 
         uploaded_documents.append(
@@ -222,23 +232,33 @@ def upload_document(
         )
 
     return {
+        "session_id": session_id,
         "documents": uploaded_documents
     }
 
+
 @app.post("/ask-ai-document")
 def ask_ai_document(
+    session_id: str,
     question: str
 ):
 
     user_question = question.strip()
 
+    if not validate_prompt_injection(user_question):
+
+        raise HTTPException(
+            status_code=400,
+            detail="The request was rejected because it contains a potentially unsafe instruction."
+        )
+
     return StreamingResponse(
         generator_document_response(
-            user_question
+            user_question,
+            session_id
         ),
         media_type="text/plain"
     )
-
 
 def get_embedding(text):
 
@@ -252,6 +272,7 @@ def get_embedding(text):
 
 def search_chroma(
     user_question,
+    session_id,
     top_k=3
 ):
 
@@ -265,7 +286,11 @@ def search_chroma(
             question_embedding
         ],
 
-        n_results=top_k
+        n_results=top_k,
+
+        where={
+            "session_id": session_id
+        }
     )
 
     relevant_chunks = results["documents"][0]
@@ -281,8 +306,31 @@ def search_chroma(
 
         print("\nDocument:", metadata["document_name"])
 
+        print("Session:", metadata["session_id"])
+
         print("Chunk number:", metadata["chunk_number"])
 
         print("Chunk:", chunk)
 
     return relevant_chunks
+
+def validate_prompt_injection(user_question):
+    
+    suspicious_patterns = [
+        "ignore previous instructions",
+        "ignore all previous instructions",
+        "ignore the instructions above",
+        "reveal the system prompt",
+        "show me the system prompt",
+        "disregard previous instructions",
+        "forget your instructions"
+    ]
+
+    normalized_question = user_question.lower()
+
+    for pattern in suspicious_patterns:
+
+        if pattern in normalized_question:
+            return False
+
+    return True
