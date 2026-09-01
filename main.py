@@ -1,16 +1,24 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from typing import List
 from pydantic import BaseModel, Field
-from openai import OpenAI
 from fastapi.responses import StreamingResponse
+from services.embedding_provider import get_embedding
+from services.llm_provider import generate_response
 import chromadb
 import uuid
 import time
 import threading
+import logging
+
 
 app = FastAPI()
 
-client = OpenAI()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger(__name__)
 
 chroma_client = chromadb.PersistentClient(
     path="./chroma_db"
@@ -21,6 +29,49 @@ collection = chroma_client.get_or_create_collection(
 )
 
 
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    start_time = time.perf_counter()
+
+    request.state.request_id = request_id
+
+    try:
+        response = await call_next(request)
+
+        duration_ms = (
+            time.perf_counter() - start_time
+        ) * 1000
+
+        logger.info(
+            "request_id=%s method=%s path=%s status=%s duration_ms=%.2f",
+            request_id,
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms
+        )
+
+        response.headers["X-Request-ID"] = request_id
+
+        return response
+
+    except Exception:
+        duration_ms = (
+            time.perf_counter() - start_time
+        ) * 1000
+
+        logger.exception(
+            "request_id=%s method=%s path=%s duration_ms=%.2f",
+            request_id,
+            request.method,
+            request.url.path,
+            duration_ms
+        )
+
+        raise
+
+
 class Question(BaseModel):
     question: str = Field(min_length=1)
 
@@ -29,16 +80,50 @@ RATE_LIMIT = 5
 RATE_WINDOW = 60
 
 request_history = {}
-
 rate_limit_lock = threading.Lock()
 
 conversation_history = {}
-
 MAX_HISTORY_MESSAGES = 6
 
 
-def get_conversation_history(session_id):
+def check_rate_limit(client_ip):
+    current_time = time.time()
 
+    with rate_limit_lock:
+        timestamps = request_history.get(
+            client_ip,
+            []
+        )
+
+        timestamps = [
+            timestamp
+            for timestamp in timestamps
+            if current_time - timestamp < RATE_WINDOW
+        ]
+
+        if len(timestamps) >= RATE_LIMIT:
+            retry_after = int(
+                RATE_WINDOW - (
+                    current_time - timestamps[0]
+                )
+            ) + 1
+
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Rate limit exceeded. "
+                    "Please try again later."
+                ),
+                headers={
+                    "Retry-After": str(retry_after)
+                }
+            )
+
+        timestamps.append(current_time)
+        request_history[client_ip] = timestamps
+
+
+def get_conversation_history(session_id):
     history = conversation_history.get(
         session_id,
         []
@@ -52,58 +137,16 @@ def add_to_conversation(
     role,
     content
 ):
-
     if session_id not in conversation_history:
         conversation_history[session_id] = []
 
-    conversation_history[session_id].append(
-        {
-            "role": role,
-            "content": content
-        }
-    )
-
-
-def check_rate_limit(client_ip):
-
-    current_time = time.time()
-
-    with rate_limit_lock:
-
-        timestamps = request_history.get(
-            client_ip,
-            []
-        )
-
-        timestamps = [
-            timestamp
-            for timestamp in timestamps
-            if current_time - timestamp < RATE_WINDOW
-        ]
-
-        if len(timestamps) >= RATE_LIMIT:
-
-            retry_after = int(
-                RATE_WINDOW - (
-                    current_time - timestamps[0]
-                )
-            ) + 1
-
-            raise HTTPException(
-                status_code=429,
-                detail="Rate limit exceeded. Please try again later.",
-                headers={
-                    "Retry-After": str(retry_after)
-                }
-            )
-
-        timestamps.append(current_time)
-
-        request_history[client_ip] = timestamps
+    conversation_history[session_id].append({
+        "role": role,
+        "content": content
+    })
 
 
 def validate_prompt_injection(user_question):
-
     suspicious_patterns = [
         "ignore previous instructions",
         "ignore all previous instructions",
@@ -116,31 +159,15 @@ def validate_prompt_injection(user_question):
 
     normalized_question = user_question.lower()
 
-    for pattern in suspicious_patterns:
-
-        if pattern in normalized_question:
-            return False
-
-    return True
-
-
-def get_embedding(text):
-
-    response = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=text
+    return not any(
+        pattern in normalized_question
+        for pattern in suspicious_patterns
     )
-
-    return response.data[0].embedding
 
 
 def extract_text_from_txt(file):
-
     contents = file.file.read()
-
-    text = contents.decode("utf-8")
-
-    return text
+    return contents.decode("utf-8")
 
 
 def split_into_chunks(
@@ -148,19 +175,12 @@ def split_into_chunks(
     chunk_size=500,
     overlap=100
 ):
-
     chunks = []
-
     start = 0
 
     while start < len(text):
-
         end = start + chunk_size
-
-        chunk = text[start:end]
-
-        chunks.append(chunk)
-
+        chunks.append(text[start:end])
         start = end - overlap
 
     return chunks
@@ -170,12 +190,23 @@ def store_chunks_in_chroma(
     chunks,
     document_id,
     document_name,
-    session_id
+    session_id,
+    request_id
 ):
-
     for index, chunk in enumerate(chunks):
+        start_time = time.perf_counter()
 
         chunk_embedding = get_embedding(chunk)
+
+        duration_ms = (
+            time.perf_counter() - start_time
+        ) * 1000
+
+        logger.info(
+            "request_id=%s embedding_completed duration_ms=%.2f",
+            request_id,
+            duration_ms
+        )
 
         collection.upsert(
             ids=[
@@ -201,12 +232,26 @@ def store_chunks_in_chroma(
 def search_chroma(
     user_question,
     session_id,
-    top_k=3
+    top_k=3,
+    request_id=None
 ):
+    start_time = time.perf_counter()
 
     question_embedding = get_embedding(
         user_question
     )
+
+    embedding_duration_ms = (
+        time.perf_counter() - start_time
+    ) * 1000
+
+    logger.info(
+        "request_id=%s embedding_completed duration_ms=%.2f",
+        request_id,
+        embedding_duration_ms
+    )
+
+    retrieval_start = time.perf_counter()
 
     results = collection.query(
         query_embeddings=[
@@ -218,9 +263,25 @@ def search_chroma(
         }
     )
 
-    relevant_chunks = results["documents"][0]
+    retrieval_duration_ms = (
+        time.perf_counter() - retrieval_start
+    ) * 1000
 
+    relevant_chunks = results["documents"][0]
     retrieved_metadata = results["metadatas"][0]
+
+    logger.info(
+        "request_id=%s retrieval_completed "
+        "embedding_ms=%.2f "
+        "chroma_ms=%.2f "
+        "top_k=%d "
+        "chunks=%d",
+        request_id,
+        embedding_duration_ms,
+        retrieval_duration_ms,
+        top_k,
+        len(relevant_chunks)
+    )
 
     print("\nTop retrieved chunks from Chroma:")
 
@@ -228,38 +289,20 @@ def search_chroma(
         relevant_chunks,
         retrieved_metadata
     ):
-
-        print(
-            "\nDocument:",
-            metadata["document_name"]
-        )
-
-        print(
-            "Session:",
-            metadata["session_id"]
-        )
-
-        print(
-            "Chunk number:",
-            metadata["chunk_number"]
-        )
-
-        print(
-            "Chunk:",
-            chunk
-        )
+        print("\nDocument:", metadata["document_name"])
+        print("Session:", metadata["session_id"])
+        print("Chunk number:", metadata["chunk_number"])
+        print("Chunk:", chunk)
 
     return relevant_chunks
 
 
 def generator_response(
     user_question,
-    session_id
+    session_id,
+    request_id
 ):
-
-    history = get_conversation_history(
-        session_id
-    )
+    history = get_conversation_history(session_id)
 
     history_text = "\n\n".join(
         f"{message['role'].capitalize()}: "
@@ -297,22 +340,16 @@ def generator_response(
     """
 
     try:
-
-        stream = client.responses.create(
-            model="gpt-4.1-mini",
-            instructions=instructions,
-            input=prompt,
-            stream=True
+        stream = generate_response(
+            instructions,
+            prompt
         )
 
         full_response = ""
 
         for event in stream:
-
             if event.type == "response.output_text.delta":
-
                 full_response += event.delta
-
                 yield event.delta
 
         add_to_conversation(
@@ -327,16 +364,18 @@ def generator_response(
             full_response
         )
 
-    except Exception as e:
-
-        print(
-            "OpenAI API error:",
-            e
+    except Exception:
+        logger.exception(
+            "request_id=%s OpenAI API error",
+            request_id
         )
 
         raise HTTPException(
             status_code=500,
-            detail="An unexpected error occurred while processing your request"
+            detail=(
+                "An unexpected error occurred "
+                "while processing your request"
+            )
         )
 
 
@@ -346,29 +385,39 @@ def ask_ai(
     session_id: str,
     question: Question
 ):
-
+    request_id = request.state.request_id
     client_ip = request.client.host
 
     check_rate_limit(client_ip)
 
     user_question = question.question.strip()
 
-    if not validate_prompt_injection(
-        user_question
-    ):
+    if not validate_prompt_injection(user_question):
+        logger.warning(
+            "request_id=%s prompt rejected",
+            request_id
+        )
 
         raise HTTPException(
             status_code=400,
             detail=(
                 "The request was rejected because "
-                "it contains a potentially unsafe instruction."
+                "it contains a potentially unsafe "
+                "instruction."
             )
         )
+
+    logger.info(
+        "request_id=%s AI request accepted session_id=%s",
+        request_id,
+        session_id
+    )
 
     return StreamingResponse(
         generator_response(
             user_question,
-            session_id
+            session_id,
+            request_id
         ),
         media_type="text/plain"
     )
@@ -376,22 +425,19 @@ def ask_ai(
 
 def generator_document_response(
     user_question,
-    session_id
+    session_id,
+    request_id
 ):
-
     relevant_chunks = search_chroma(
         user_question,
         session_id,
-        top_k=3
+        top_k=3,
+        request_id=request_id
     )
 
-    context = "\n\n".join(
-        relevant_chunks
-    )
+    context = "\n\n".join(relevant_chunks)
 
-    history = get_conversation_history(
-        session_id
-    )
+    history = get_conversation_history(session_id)
 
     history_text = "\n\n".join(
         f"{message['role'].capitalize()}: "
@@ -432,24 +478,48 @@ def generator_document_response(
     {user_question}
     """
 
-    try:
+    llm_start_time = time.perf_counter()
+    first_token_time = None
+    full_response = ""
 
-        stream = client.responses.create(
-            model="gpt-4.1-mini",
-            instructions=instructions,
-            input=prompt,
-            stream=True
+    try:
+        stream = generate_response(
+            instructions,
+            prompt
         )
 
-        full_response = ""
-
         for event in stream:
-
             if event.type == "response.output_text.delta":
 
-                full_response += event.delta
+                if first_token_time is None:
+                    first_token_time = (
+                        time.perf_counter()
+                        - llm_start_time
+                    ) * 1000
 
+                    logger.info(
+                        "request_id=%s "
+                        "llm_first_token "
+                        "duration_ms=%.2f",
+                        request_id,
+                        first_token_time
+                    )
+
+                full_response += event.delta
                 yield event.delta
+
+        total_llm_time = (
+            time.perf_counter()
+            - llm_start_time
+        ) * 1000
+
+        logger.info(
+            "request_id=%s "
+            "llm_completed "
+            "duration_ms=%.2f",
+            request_id,
+            total_llm_time
+        )
 
         add_to_conversation(
             session_id,
@@ -463,42 +533,37 @@ def generator_document_response(
             full_response
         )
 
-    except Exception as e:
-
-        print(
-            "OpenAI API error:",
-            e
+    except Exception:
+        logger.exception(
+            "request_id=%s OpenAI API error",
+            request_id
         )
 
         raise HTTPException(
             status_code=500,
-            detail="An unexpected error occurred while processing your request"
+            detail=(
+                "An unexpected error occurred "
+                "while processing your request"
+            )
         )
 
 
 @app.post("/upload-document")
 def upload_document(
+    request: Request,
     files: List[UploadFile] = File(...),
     session_id: str = ""
 ):
+    request_id = request.state.request_id
 
     if not session_id:
-
-        session_id = str(
-            uuid.uuid4()
-        )
+        session_id = str(uuid.uuid4())
 
     uploaded_documents = []
 
     for file in files:
-
-        document_text = extract_text_from_txt(
-            file
-        )
-
-        document_id = str(
-            uuid.uuid4()
-        )
+        document_text = extract_text_from_txt(file)
+        document_id = str(uuid.uuid4())
 
         chunks = split_into_chunks(
             document_text,
@@ -510,15 +575,22 @@ def upload_document(
             chunks,
             document_id,
             file.filename,
-            session_id
+            session_id,
+            request_id
         )
 
-        uploaded_documents.append(
-            {
-                "document_id": document_id,
-                "document_name": file.filename
-            }
-        )
+        uploaded_documents.append({
+            "document_id": document_id,
+            "document_name": file.filename
+        })
+
+    logger.info(
+        "request_id=%s document_upload_completed "
+        "session_id=%s documents=%d",
+        request_id,
+        session_id,
+        len(uploaded_documents)
+    )
 
     return {
         "session_id": session_id,
@@ -532,29 +604,40 @@ def ask_ai_document(
     session_id: str,
     question: str
 ):
-
+    request_id = request.state.request_id
     client_ip = request.client.host
 
     check_rate_limit(client_ip)
 
     user_question = question.strip()
 
-    if not validate_prompt_injection(
-        user_question
-    ):
+    if not validate_prompt_injection(user_question):
+        logger.warning(
+            "request_id=%s prompt rejected",
+            request_id
+        )
 
         raise HTTPException(
             status_code=400,
             detail=(
                 "The request was rejected because "
-                "it contains a potentially unsafe instruction."
+                "it contains a potentially unsafe "
+                "instruction."
             )
         )
+
+    logger.info(
+        "request_id=%s document request accepted "
+        "session_id=%s",
+        request_id,
+        session_id
+    )
 
     return StreamingResponse(
         generator_document_response(
             user_question,
-            session_id
+            session_id,
+            request_id
         ),
         media_type="text/plain"
     )
