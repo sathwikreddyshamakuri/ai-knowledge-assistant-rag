@@ -1,23 +1,25 @@
 # AI Knowledge Assistant — Retrieval-Augmented Generation (RAG)
 
-A Retrieval-Augmented Generation (RAG) backend built with **FastAPI**, the **OpenAI Responses API**, and **ChromaDB** for answering natural language questions over user-uploaded documents.
+A RAG backend built with **FastAPI**, **OpenAI**, **LangChain**, and **ChromaDB** for answering questions about uploaded documents.
 
-Instead of relying solely on an LLM's internal knowledge, the system retrieves semantically relevant document chunks from a vector database and injects them into the prompt, allowing responses to remain grounded in uploaded content.
+The project started as a RAG pipeline built directly with the OpenAI API and ChromaDB. That gave me a chance to understand what happens under the hood — chunking, embeddings, vector search, prompt construction, and response streaming. I'm now introducing LangChain step by step to see where its abstractions are actually useful in a real application.
 
 ---
 
 ## Project Overview
 
-This project implements the core components of a RAG pipeline from scratch: document chunking, embedding generation, vector indexing, semantic retrieval, prompt construction, and streaming responses.
+The assistant takes uploaded documents, breaks them into smaller chunks, creates embeddings for those chunks, and stores them in ChromaDB.
 
-A deliberate design decision was made **not** to use orchestration frameworks such as LangChain or LlamaIndex. Building each component directly against the OpenAI API and ChromaDB made it possible to understand retrieval behavior, vector indexing, prompt construction, and streaming mechanics without framework abstractions.
+When a user asks a question, the system searches for the most relevant chunks and uses them as context for the LLM instead of relying only on the model's built-in knowledge.
+
+The project is intentionally being built in stages. I first implemented the core RAG flow myself and then started adding LangChain so I can understand both approaches rather than treating the framework as a black box.
 
 ---
 
 ## System Architecture
 
-```
-                Upload Documents
+```text
+                 Upload Document
                         │
                         ▼
               Text Extraction (.txt)
@@ -26,89 +28,166 @@ A deliberate design decision was made **not** to use orchestration frameworks su
              Overlapping Chunking
                         │
                         ▼
-         OpenAI Embedding Generation
+              Embedding Generation
                         │
                         ▼
-              Chroma Vector Database
+                ChromaDB Storage
+                        │
                         │
                         ▼
-           Semantic Similarity Search
+                  User Question
                         │
                         ▼
-         Top-K Relevant Chunks Retrieved
+             LangChain Retriever
                         │
                         ▼
-      OpenAI Responses API (Grounded Prompt)
+          Top 3 Relevant Document Chunks
                         │
                         ▼
-          Streaming Response via FastAPI
+              Conversation History
+                        │
+                        ▼
+                Prompt Construction
+                        │
+                        ▼
+                   OpenAI LLM
+                        │
+                        ▼
+             Streaming API Response
 ```
 
 ---
 
 ## Features
 
-- Semantic document search using vector embeddings
-- Multi-document indexing
 - Retrieval-Augmented Generation (RAG)
-- Streaming AI responses
+- Semantic search over uploaded documents
+- Multi-document indexing
 - Automatic document chunking
-- OpenAI embedding generation
+- OpenAI embeddings
 - ChromaDB vector storage
-- Metadata-aware document indexing
-- FastAPI REST API backend
+- LangChain retriever abstraction
+- Metadata-based session filtering
+- Conversational memory
+- Basic prompt-injection validation
+- Request rate limiting
+- Request ID based logging
+- Embedding, retrieval, and LLM timing logs
+- Streaming responses with FastAPI
+- Swagger API documentation
 
 ---
 
 ## Engineering Decisions
 
-### Building without RAG frameworks
+### Building the first version without LangChain
 
-Rather than using LangChain or LlamaIndex, the retrieval pipeline was implemented directly against the OpenAI API and ChromaDB.
+The first version was intentionally built directly against the OpenAI API and ChromaDB.
 
-This exposed every stage of the retrieval process:
+This made each part of the RAG pipeline visible:
 
-- document chunking
-- embedding generation
-- vector indexing
-- similarity search
-- prompt construction
-- streaming responses
+```text
+Document
+   ↓
+Chunking
+   ↓
+Embedding
+   ↓
+Vector Storage
+   ↓
+Similarity Search
+   ↓
+Context
+   ↓
+Prompt
+   ↓
+LLM
+```
 
-The goal was to understand how modern RAG systems work internally before introducing orchestration frameworks.
+Once that flow was working, LangChain was introduced gradually.
 
-### Chunk size (500 characters)
+The goal is not to use a framework just because it is popular. The goal is to understand what it provides and where it actually makes the application easier to build and maintain.
 
-Documents are divided into approximately 500-character chunks. This size was selected because:
+### LangChain
 
-- chunks remain small enough to retrieve precise information
-- embeddings remain focused on a single topic
-- context windows are used efficiently
-- retrieval avoids returning unnecessarily large passages
+LangChain is currently being introduced around the retrieval and LLM portions of the application.
 
-Very large chunks reduce retrieval precision, because multiple unrelated concepts become embedded together.
+Some of the main abstractions being used are:
 
-### Overlap (100 characters)
+- `OpenAIEmbeddings` for embedding generation
+- `Chroma` for the vector store integration
+- `Retriever` for document retrieval
+- `Document` for standardized document content and metadata
+- Prompt templates for prompt construction
+- LLM interfaces for model interaction
+- Runnables and LCEL for connecting components
 
-A 100-character overlap is maintained between consecutive chunks.
+The underlying services have not changed. ChromaDB is still the vector database and OpenAI is still being used for embeddings and generation. LangChain sits between the application and those services and provides common interfaces for working with them.
 
-Without overlap, important sentences located near chunk boundaries may be split across two chunks, causing incomplete retrieval. Overlapping preserves context while introducing only a small amount of redundancy.
+### Chunking
+
+Documents are currently split into approximately **500-character chunks** with a **100-character overlap**.
+
+The goal is to keep each retrieved passage focused enough to be useful while still preserving some context between neighboring chunks.
+
+Chunking happens before embedding. Each chunk gets its own embedding rather than creating one embedding for the entire document.
 
 ### Top-K retrieval
 
-The system retrieves the top 3 most semantically similar chunks. Three chunks generally provide enough context for accurate responses while keeping prompts compact.
+The retriever currently returns the **top 3 most relevant chunks**.
 
-Retrieving too few risks missing relevant information; retrieving too many increases token usage and may introduce unrelated context.
+The value is configured on the retriever itself rather than being passed into every retrieval call.
 
-### Embedding model selection
+This keeps the retrieval behavior in one place and makes it easier to change later.
 
-The project currently uses `text-embedding-3-small` for:
+### Metadata filtering
 
-- lower latency
-- lower API cost
-- strong semantic retrieval quality for small and medium-sized document collections
+Each stored chunk includes metadata such as:
 
-Although `text-embedding-3-large` provides higher-quality embeddings, the additional cost was not justified at the current scale. The implementation is model-agnostic and can be upgraded without architectural changes.
+```text
+document_id
+document_name
+chunk_number
+session_id
+```
+
+The `session_id` is used during retrieval so a question only searches the documents associated with that session.
+
+### Embeddings
+
+The project currently uses:
+
+```text
+text-embedding-3-small
+```
+
+It provides a good balance between retrieval quality, latency, and API cost for the current size of the project.
+
+The embedding layer is kept separate from the rest of the application so the model or provider can be changed later without rewriting the retrieval logic.
+
+### Conversation history
+
+The application keeps recent conversation history for each session.
+
+This allows follow-up questions to use previous messages as context instead of treating every question as completely independent.
+
+The conversation history is currently kept in memory. LangChain's message-history abstractions will be explored as part of the next stages of the project.
+
+### Prompt-injection validation
+
+A basic validation layer checks incoming requests for common prompt-injection patterns.
+
+This is intentionally a simple guardrail. It is not meant to be a complete security solution.
+
+### Rate limiting
+
+The API currently limits clients to:
+
+```text
+5 requests per minute
+```
+
+The current implementation is in memory and is intended for the learning project. A distributed production deployment would need a shared mechanism such as Redis.
 
 ---
 
@@ -118,11 +197,15 @@ Although `text-embedding-3-large` provides higher-quality embeddings, the additi
 |---|---|
 | Language | Python |
 | Backend | FastAPI |
-| LLM | OpenAI Responses API |
+| LLM | OpenAI |
+| LLM API | OpenAI Responses API |
 | Embeddings | `text-embedding-3-small` |
+| Orchestration | LangChain |
 | Vector Database | ChromaDB |
 | API Testing | Swagger UI |
 | Streaming | FastAPI `StreamingResponse` |
+| Configuration | `.env` |
+| Logging | Python logging |
 
 ---
 
@@ -130,23 +213,48 @@ Although `text-embedding-3-large` provides higher-quality embeddings, the additi
 
 ### `POST /upload-document`
 
-Uploads one or more text documents. Each uploaded document is extracted, chunked, embedded, and indexed in ChromaDB.
+Uploads one or more text documents.
+
+The documents are extracted, split into chunks, embedded, and stored in ChromaDB along with their metadata.
 
 ### `POST /ask-ai`
 
-General-purpose AI endpoint without retrieval.
+General-purpose AI endpoint that does not use document retrieval.
 
 ### `POST /ask-ai-document`
 
-Question-answering endpoint backed by semantic retrieval.
+Answers questions using the uploaded documents.
 
-Workflow:
+The current workflow is:
 
-1. Embed the user's question
-2. Perform semantic similarity search in ChromaDB
-3. Retrieve the top-K matching chunks
-4. Build a grounded prompt
-5. Generate a streamed response
+1. Receive the user's question
+2. Search for relevant document chunks
+3. Apply the session metadata filter
+4. Include recent conversation history
+5. Build the grounded prompt
+6. Generate and stream the response
+
+---
+
+## Observability
+
+Requests are assigned a unique request ID.
+
+The same request ID is passed through the major parts of the pipeline so that a request can be followed through logs:
+
+```text
+Request
+   ↓
+Embedding
+   ↓
+Retrieval
+   ↓
+LLM
+   ↓
+Response
+```
+
+Timing information is also recorded for important operations, which makes it easier to see where latency is coming from during development and debugging.
 
 ---
 
@@ -155,49 +263,70 @@ Workflow:
 - Multi-document indexing
 - Semantic vector search
 - Retrieval-Augmented Generation
+- LangChain retrieval abstractions
+- Session-based retrieval filtering
+- Conversational memory
+- Prompt-injection validation
+- Basic rate limiting
+- Request-level logging
+- Retrieval and LLM latency tracking
 - Streaming responses
-- Metadata-aware indexing
-- OpenAI embedding generation
+- FastAPI REST API
+- OpenAI integration
 - ChromaDB integration
-- FastAPI backend
 
 ---
 
 ## Challenges Encountered
 
-Several implementation issues were identified and resolved during development:
+A few issues came up while building the project:
 
-- **Manual similarity search.** Initial retrieval used hand-written cosine similarity before migrating to ChromaDB's built-in vector search.
-- **Chunk ID collisions.** Chunk IDs originally collided when multiple documents were uploaded, silently overwriting data. Unique document-scoped chunk identifiers were introduced to prevent this.
-- **Single-document retrieval.** Retrieval was initially limited to individual documents. The architecture was redesigned to support semantic retrieval across the entire indexed collection.
-- **Missing grounding.** Prompt construction was updated so retrieved context is always supplied to the model before answer generation.
+- **Manual similarity search:** The first version used hand-written similarity logic before moving to ChromaDB's vector search.
+- **Chunk ID collisions:** Chunk IDs originally collided across documents, which could cause existing chunks to be overwritten. Document-scoped IDs were added to fix this.
+- **Single-document retrieval:** Retrieval initially focused on one document at a time. It was later changed to search across the indexed collection.
+- **Grounding:** Prompt construction was updated so retrieved document content is explicitly supplied to the model.
+- **Session isolation:** Metadata filtering was added so retrieval results stay within the appropriate session.
+- **Observability:** Request IDs were propagated through embedding, retrieval, and LLM operations to make debugging individual requests easier.
+- **Framework migration:** LangChain is being introduced gradually after the underlying RAG flow was implemented directly. This makes it easier to compare the two approaches and understand what the framework is actually doing.
 
 ---
 
 ## Current Limitations
 
-The current implementation intentionally keeps the architecture simple.
+The project is still intentionally focused on the core RAG and LLM application workflow.
 
 - Supports `.txt` documents only
-- No user authentication or session isolation
-- No rate limiting or request throttling
-- No retrieval evaluation metrics (Recall@K, Precision@K, MRR, hit rate)
-- No citation highlighting of retrieved source passages
-- Previously uploaded documents remain indexed until the vector database is cleared
-- No frontend; interaction is through FastAPI Swagger UI
+- Conversation history is stored in memory
+- Rate limiting is stored in memory
+- Prompt-injection protection is basic
+- No authentication system
+- No frontend
+- No automated test suite yet
+- No production-grade persistent conversation store
+- No advanced reranking pipeline
+- No distributed deployment
 
 ---
 
 ## Planned Enhancements
 
-- PDF document support
-- Session-based document isolation
-- Metadata filtering
-- Conversational memory
-- Source citations
+The next stages of the project will build on the current RAG foundation:
+
+- Complete LangChain integration
+- Better prompt and chain orchestration
+- LangGraph agent workflows
+- Tool calling
+- MCP integration
+- PDF and Word document support
+- Improved document ingestion
+- Retrieval improvements and reranking
+- Automated testing
 - Docker containerization
+- CI/CD pipeline
 - React frontend
-- AWS deployment
+- Cloud deployment
+- Production-grade observability
+- Persistent conversation storage
 
 ---
 
@@ -215,7 +344,7 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Configure your API key in a `.env` file:
+Create a `.env` file:
 
 ```bash
 OPENAI_API_KEY=your_api_key
@@ -227,7 +356,11 @@ Run the server:
 uvicorn main:app --reload
 ```
 
-Open Swagger UI at `http://127.0.0.1:8000/docs`.
+Open Swagger UI:
+
+```text
+http://127.0.0.1:8000/docs
+```
 
 ---
 
