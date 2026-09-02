@@ -2,9 +2,12 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from typing import List
 from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse
-from services.embedding_provider import get_embedding
-from services.llm_provider import generate_response
-import chromadb
+
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+
 import uuid
 import time
 import threading
@@ -13,6 +16,7 @@ import logging
 
 app = FastAPI()
 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
@@ -20,13 +24,74 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-chroma_client = chromadb.PersistentClient(
-    path="./chroma_db"
+
+# LangChain embedding and vector store
+
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small"
 )
 
-collection = chroma_client.get_or_create_collection(
-    name="documents"
+vectorstore = Chroma(
+    collection_name="documents",
+    embedding_function=embeddings,
+    persist_directory="./chroma_db"
 )
+
+
+# LangChain LLM
+
+llm = ChatOpenAI(
+    model="gpt-4.1-mini",
+    temperature=0
+)
+
+
+# Prompts
+
+general_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """You are a helpful AI Knowledge Assistant.
+Use the conversation history to understand follow-up questions.
+Explain concepts clearly and accurately, adapting to the user's level.
+Use simple language, define technical terms, and provide examples when helpful.
+Do not invent facts.
+If uncertain, say so.
+Answer the user's question directly."""
+    ),
+    (
+        "human",
+        """Conversation History:
+{history}
+
+Current User Question:
+{question}"""
+    )
+])
+
+
+document_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """You are a helpful AI Knowledge Assistant.
+Answer the user's question using the provided document context and conversation history.
+Use simple language.
+Do not invent facts that are not supported by the provided context.
+If the answer cannot be found in the context, say so.
+Use conversation history only to understand references and follow-up questions."""
+    ),
+    (
+        "human",
+        """Conversation History:
+{history}
+
+Document Context:
+{context}
+
+Current User Question:
+{question}"""
+    )
+])
 
 
 @app.middleware("http")
@@ -193,40 +258,44 @@ def store_chunks_in_chroma(
     session_id,
     request_id
 ):
+    documents = []
+    ids = []
+
     for index, chunk in enumerate(chunks):
-        start_time = time.perf_counter()
-
-        chunk_embedding = get_embedding(chunk)
-
-        duration_ms = (
-            time.perf_counter() - start_time
-        ) * 1000
-
-        logger.info(
-            "request_id=%s embedding_completed duration_ms=%.2f",
-            request_id,
-            duration_ms
-        )
-
-        collection.upsert(
-            ids=[
-                f"{document_id}_chunk_{index}"
-            ],
-            embeddings=[
-                chunk_embedding
-            ],
-            documents=[
-                chunk
-            ],
-            metadatas=[
-                {
+        documents.append(
+            Document(
+                page_content=chunk,
+                metadata={
                     "document_id": document_id,
                     "document_name": document_name,
                     "chunk_number": index,
                     "session_id": session_id
                 }
-            ]
+            )
         )
+
+        ids.append(
+            f"{document_id}_chunk_{index}"
+        )
+
+    start_time = time.perf_counter()
+
+    vectorstore.add_documents(
+        documents=documents,
+        ids=ids
+    )
+
+    duration_ms = (
+        time.perf_counter() - start_time
+    ) * 1000
+
+    logger.info(
+        "request_id=%s document_embedding_completed "
+        "duration_ms=%.2f chunks=%d",
+        request_id,
+        duration_ms,
+        len(documents)
+    )
 
 
 def search_chroma(
@@ -237,64 +306,39 @@ def search_chroma(
 ):
     start_time = time.perf_counter()
 
-    question_embedding = get_embedding(
+    retriever = vectorstore.as_retriever(
+        search_kwargs={
+            "k": top_k,
+            "filter": {
+                "session_id": session_id
+            }
+        }
+    )
+
+    documents = retriever.invoke(
         user_question
     )
 
-    embedding_duration_ms = (
+    retrieval_duration_ms = (
         time.perf_counter() - start_time
     ) * 1000
 
     logger.info(
-        "request_id=%s embedding_completed duration_ms=%.2f",
-        request_id,
-        embedding_duration_ms
-    )
-
-    retrieval_start = time.perf_counter()
-
-    results = collection.query(
-        query_embeddings=[
-            question_embedding
-        ],
-        n_results=top_k,
-        where={
-            "session_id": session_id
-        }
-    )
-
-    retrieval_duration_ms = (
-        time.perf_counter() - retrieval_start
-    ) * 1000
-
-    relevant_chunks = results["documents"][0]
-    retrieved_metadata = results["metadatas"][0]
-
-    logger.info(
         "request_id=%s retrieval_completed "
-        "embedding_ms=%.2f "
-        "chroma_ms=%.2f "
-        "top_k=%d "
-        "chunks=%d",
+        "duration_ms=%.2f top_k=%d chunks=%d",
         request_id,
-        embedding_duration_ms,
         retrieval_duration_ms,
         top_k,
-        len(relevant_chunks)
+        len(documents)
     )
 
-    print("\nTop retrieved chunks from Chroma:")
+    print("\nTop retrieved documents:")
 
-    for chunk, metadata in zip(
-        relevant_chunks,
-        retrieved_metadata
-    ):
-        print("\nDocument:", metadata["document_name"])
-        print("Session:", metadata["session_id"])
-        print("Chunk number:", metadata["chunk_number"])
-        print("Chunk:", chunk)
+    for doc in documents:
+        print("\nMetadata:", doc.metadata)
+        print("Content:", doc.page_content)
 
-    return relevant_chunks
+    return documents
 
 
 def generator_response(
@@ -302,7 +346,9 @@ def generator_response(
     session_id,
     request_id
 ):
-    history = get_conversation_history(session_id)
+    history = get_conversation_history(
+        session_id
+    )
 
     history_text = "\n\n".join(
         f"{message['role'].capitalize()}: "
@@ -310,47 +356,48 @@ def generator_response(
         for message in history
     )
 
-    instructions = """
-    You are a helpful AI Knowledge Assistant.
+    messages = general_prompt.invoke({
+        "history": history_text,
+        "question": user_question
+    })
 
-    Use the conversation history to understand
-    follow-up questions.
-
-    Explain concepts clearly and accurately,
-    adapting to the user's level.
-
-    Use simple language, define technical terms,
-    and provide examples when helpful.
-
-    Do not invent facts.
-
-    If uncertain, say so.
-
-    Answer the user's question directly.
-    """
-
-    prompt = f"""
-    Conversation History:
-
-    {history_text}
-
-    Current User Question:
-
-    {user_question}
-    """
+    llm_start_time = time.perf_counter()
+    first_token_time = None
+    full_response = ""
 
     try:
-        stream = generate_response(
-            instructions,
-            prompt
+        for chunk in llm.stream(messages):
+            if chunk.content:
+
+                if first_token_time is None:
+                    first_token_time = (
+                        time.perf_counter()
+                        - llm_start_time
+                    ) * 1000
+
+                    logger.info(
+                        "request_id=%s "
+                        "llm_first_token "
+                        "duration_ms=%.2f",
+                        request_id,
+                        first_token_time
+                    )
+
+                full_response += chunk.content
+
+                yield chunk.content
+
+        total_llm_time = (
+            time.perf_counter()
+            - llm_start_time
+        ) * 1000
+
+        logger.info(
+            "request_id=%s llm_completed "
+            "duration_ms=%.2f",
+            request_id,
+            total_llm_time
         )
-
-        full_response = ""
-
-        for event in stream:
-            if event.type == "response.output_text.delta":
-                full_response += event.delta
-                yield event.delta
 
         add_to_conversation(
             session_id,
@@ -366,7 +413,7 @@ def generator_response(
 
     except Exception:
         logger.exception(
-            "request_id=%s OpenAI API error",
+            "request_id=%s LLM error",
             request_id
         )
 
@@ -392,7 +439,9 @@ def ask_ai(
 
     user_question = question.question.strip()
 
-    if not validate_prompt_injection(user_question):
+    if not validate_prompt_injection(
+        user_question
+    ):
         logger.warning(
             "request_id=%s prompt rejected",
             request_id
@@ -408,7 +457,8 @@ def ask_ai(
         )
 
     logger.info(
-        "request_id=%s AI request accepted session_id=%s",
+        "request_id=%s AI request accepted "
+        "session_id=%s",
         request_id,
         session_id
     )
@@ -428,16 +478,21 @@ def generator_document_response(
     session_id,
     request_id
 ):
-    relevant_chunks = search_chroma(
+    documents = search_chroma(
         user_question,
         session_id,
         top_k=3,
         request_id=request_id
     )
 
-    context = "\n\n".join(relevant_chunks)
+    context = "\n\n".join(
+        doc.page_content
+        for doc in documents
+    )
 
-    history = get_conversation_history(session_id)
+    history = get_conversation_history(
+        session_id
+    )
 
     history_text = "\n\n".join(
         f"{message['role'].capitalize()}: "
@@ -445,51 +500,19 @@ def generator_document_response(
         for message in history
     )
 
-    instructions = """
-    You are a helpful AI Knowledge Assistant.
-
-    Answer the user's question using the
-    provided document context and conversation history.
-
-    Use simple language.
-
-    Do not invent facts that are not supported
-    by the provided context.
-
-    If the answer cannot be found in the context,
-    say so.
-
-    Use conversation history only to understand
-    references such as "it", "they", "that",
-    or follow-up questions.
-    """
-
-    prompt = f"""
-    Conversation History:
-
-    {history_text}
-
-    Document Context:
-
-    {context}
-
-    Current User Question:
-
-    {user_question}
-    """
+    messages = document_prompt.invoke({
+        "history": history_text,
+        "context": context,
+        "question": user_question
+    })
 
     llm_start_time = time.perf_counter()
     first_token_time = None
     full_response = ""
 
     try:
-        stream = generate_response(
-            instructions,
-            prompt
-        )
-
-        for event in stream:
-            if event.type == "response.output_text.delta":
+        for chunk in llm.stream(messages):
+            if chunk.content:
 
                 if first_token_time is None:
                     first_token_time = (
@@ -505,8 +528,9 @@ def generator_document_response(
                         first_token_time
                     )
 
-                full_response += event.delta
-                yield event.delta
+                full_response += chunk.content
+
+                yield chunk.content
 
         total_llm_time = (
             time.perf_counter()
@@ -514,8 +538,7 @@ def generator_document_response(
         ) * 1000
 
         logger.info(
-            "request_id=%s "
-            "llm_completed "
+            "request_id=%s llm_completed "
             "duration_ms=%.2f",
             request_id,
             total_llm_time
@@ -535,7 +558,7 @@ def generator_document_response(
 
     except Exception:
         logger.exception(
-            "request_id=%s OpenAI API error",
+            "request_id=%s LLM error",
             request_id
         )
 
@@ -562,7 +585,10 @@ def upload_document(
     uploaded_documents = []
 
     for file in files:
-        document_text = extract_text_from_txt(file)
+        document_text = extract_text_from_txt(
+            file
+        )
+
         document_id = str(uuid.uuid4())
 
         chunks = split_into_chunks(
@@ -611,7 +637,9 @@ def ask_ai_document(
 
     user_question = question.strip()
 
-    if not validate_prompt_injection(user_question):
+    if not validate_prompt_injection(
+        user_question
+    ):
         logger.warning(
             "request_id=%s prompt rejected",
             request_id
