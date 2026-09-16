@@ -332,35 +332,76 @@ The next stages of the project will build on the current RAG foundation:
 
 ## Running the Project
 
-Clone the repository:
+### Prerequisites
+
+- Python 3.10+
+- An OpenAI API key
+
+### 1. Clone the repository
 
 ```bash
 git clone https://github.com/sathwikreddyshamakuri/ai-knowledge-assistant-rag
+cd ai-knowledge-assistant-rag
 ```
 
-Install dependencies:
+### 2. Create and activate a virtual environment (recommended)
+
+```bash
+python -m venv venv
+
+# Windows
+venv\Scripts\activate
+
+# macOS / Linux
+source venv/bin/activate
+```
+
+### 3. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Create a `.env` file:
+### 4. Set your OpenAI API key
+
+The app reads `OPENAI_API_KEY` from the environment, so it must be exported in your shell (a `.env` file on its own is not loaded automatically):
 
 ```bash
-OPENAI_API_KEY=your_api_key
+# Windows (PowerShell)
+$env:OPENAI_API_KEY = "your_api_key"
+
+# macOS / Linux
+export OPENAI_API_KEY=your_api_key
 ```
 
-Run the server:
+### 5. Run the server
 
 ```bash
 uvicorn main:app --reload
 ```
 
-Open Swagger UI:
+The API is now running at `http://127.0.0.1:8000`.
+
+### 6. Try it out
+
+Open Swagger UI to explore and call the endpoints interactively:
 
 ```text
 http://127.0.0.1:8000/docs
 ```
+
+Or from the command line:
+
+```bash
+# Upload a document
+curl -X POST "http://127.0.0.1:8000/upload-document?session_id=demo" \
+  -F "files=@your_document.txt"
+
+# Ask a question about it
+curl -X POST "http://127.0.0.1:8000/ask-ai-document?session_id=demo&question=What%20is%20this%20document%20about%3F"
+```
+
+Vector data persists between runs in the local `chroma_db/` directory — delete it if you want to start from a clean index.
 
 ---
 
